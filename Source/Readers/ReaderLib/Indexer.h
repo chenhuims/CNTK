@@ -53,16 +53,59 @@ private:
 
     uint32_t m_offsetInChunk;         // sequence offset in the chunk (in bytes)
     uint32_t m_byteSize;                 // size in bytes
+
     friend struct Index;
+    friend class ChunkDescriptor;
 };
 
 // Chunk metadata, similar to the sequence descriptor above,
 // but used to facilitate indexing and retrieval of blobs of input data of
 // some user-specified size.
-struct ChunkDescriptor : ChunkDescription
+class ChunkDescriptor
 {
-    ChunkDescriptor() : ChunkDescription({}), m_byteSize(0), m_offset(0) {}
+    ChunkDescriptor() : m_maxSizeInBytes(0), m_offset(0) {}
 
+public:
+    const size_t m_maxSizeInBytes;
+
+    // offset of the chunk in bytes
+    const size_t m_offset;
+
+    ChunkDescriptor(size_t maxSizeInBytes, size_t startOffset)
+        : m_maxSizeInBytes(maxSizeInBytes), m_sizeInBytes(0),
+          m_offset(startOffset), m_numberOfSamples(0)
+    {}
+
+    bool HasSpaceFor(const SequenceDescriptor& sd) const
+    {
+        return m_sizeInBytes == 0 || m_sizeInBytes + sd.m_byteSize <= m_maxSizeInBytes;
+    }
+
+    void AddSequence(SequenceDescriptor&& sd, bool trackFirstSample = false)
+    {
+        assert(HasSpaceFor(sd));
+        if (trackFirstSample) // Adding number of samples where the new sequence starts.
+            m_sequenceOffsetInChunkInSamples.push_back(static_cast<uint32_t>(m_numberOfSamples));
+
+        m_sizeInBytes += sd.m_byteSize;
+        m_numberOfSamples += sd.m_numberOfSamples;
+        m_sequences.push_back(std::move(sd));
+
+        if (m_sizeInBytes >= m_maxSizeInBytes) // Last one, finalizing.
+            m_sequences.shrink_to_fit();
+
+        if (m_sequences.size() > std::numeric_limits<uint32_t>::max())
+            RuntimeError("Exceeded maximum number of sequences in a chunk");
+    }
+
+    size_t SizeInBytes() const { return m_sizeInBytes; }
+    size_t NumSamples() const { return m_numberOfSamples; }
+    const std::vector<SequenceDescriptor>& Sequences() const { return m_sequences; }
+
+    // Offset of first sample of each sequence from the beginning of the chunk.
+    const std::vector<uint32_t>& SequenceOffsetInSamples() const { return m_sequenceOffsetInChunkInSamples; }
+
+private:
     // TODO: if we don't want to keep the whole index
     // (metadata for all sequences in memory), we should not
     // leave this empty when building a chunk index, and only
@@ -70,8 +113,8 @@ struct ChunkDescriptor : ChunkDescription
     // (the indexer will have to do a second pass for this chunk).
     std::vector<SequenceDescriptor> m_sequences;
 
-    size_t m_offset;   // offset of the chunk in bytes
-    size_t m_byteSize; // size in bytes
+    size_t m_numberOfSamples;
+    size_t m_sizeInBytes;
 
     // Offset of first sample of each sequence from the beginning of the chunk.
     // Optionally filled in by the indexer.
@@ -86,8 +129,16 @@ typedef shared_ptr<ChunkDescriptor> ChunkDescriptorPtr;
 // It also stores a mapping of keys into sequence descriptors.
 struct Index
 {
-    std::vector<ChunkDescriptor> m_chunks;                                  // chunks
-    std::map<size_t, std::pair<uint32_t, uint32_t>> m_keyToSequenceInChunk; // sequence key -> <chunk index, sequence index in chunk>
+private:
+    std::vector<ChunkDescriptor> m_chunks;
+
+public:
+    const std::vector<ChunkDescriptor>& Chunks() const { return m_chunks; }
+
+    // Sorted dictionary of <sequence key, chunk index, sequence index in chunk>
+    // used for fast retrieval of sequence by key for non primary deserializers.
+    std::vector<std::tuple<size_t, uint32_t, uint32_t>> m_keyToSequenceInChunk;
+
     const size_t m_maxChunkSize;                                            // maximum chunk size in bytes
     bool m_primary;                                                         // index for primary deserializer
     bool m_trackFirstSamples;                                               // flag indicating whether to build index of first samples
@@ -97,7 +148,8 @@ struct Index
 
     Index(size_t chunkSize, bool primary, bool trackFirstSamples = false)
         : m_maxChunkSize(chunkSize), m_primary(primary), m_trackFirstSamples(trackFirstSamples)
-    {}
+    {
+    }
 
     // Adds sequence (metadata) to the index. Additionally, it
     // assigns an appropriate chunk id to the sequence descriptor,
@@ -109,11 +161,7 @@ struct Index
     void Reserve(size_t sizeInBytes)
     {
         if (m_maxChunkSize > 0)
-        {
             m_chunks.reserve((sizeInBytes + m_maxChunkSize - 1) / m_maxChunkSize);
-        }
-
-        m_chunks.push_back({});
     }
 
     // Checks if the index is empty.
@@ -122,7 +170,65 @@ struct Index
         return m_chunks.empty();
     }
 
+    // Returns true or false with chunk and sequence index depending if the key has been found.
+    std::tuple<bool, uint32_t, uint32_t> GetSequenceByKey(size_t key) const;
+
+    void MapSequenceKeyToLocation();
+
     DISABLE_COPY_AND_MOVE(Index);
+};
+
+struct Buffer
+{
+    Buffer(size_t maxSize) : m_maxSize(maxSize) {}
+
+    const char* Start() const { return m_data.data(); }
+    const char* End() const { return m_data.data() + m_data.size(); }
+
+    int64_t GetFileOffset() const { return m_fileOffsetStart + (m_current - Start()); }
+
+    // If buffer starts with UTF-8 BOM value, skip it.
+    void SkipBOMIfPresent()
+    {
+        assert(m_current == m_data.data());
+        if ((m_data.size() > 3) &&
+            (m_data[0] == '\xEF' && m_data[1] == '\xBB' && m_data[2] == '\xBF'))
+        {
+            m_current += 3;
+        }
+    }
+
+    void RefillFrom(FILE* file)
+    {
+        if (m_done)
+            return;
+
+        m_fileOffsetStart += m_data.size();
+        m_data.resize(m_maxSize);
+        m_current = m_data.data();
+        size_t bytesRead = fread(m_data.data(), 1, m_maxSize, file);
+        if (bytesRead == (size_t)-1)
+            RuntimeError("Could not read from the input file.");
+        m_data.resize(bytesRead);
+        if (!bytesRead)
+            m_done = true;
+    }
+
+    const char* MoveToNextLine()
+    {
+        m_current = (char*)memchr(m_current, g_Row_Delimiter, End() - m_current);
+        if (m_current)
+            ++m_current;
+        return m_current;
+    }
+
+    bool Eof() const { return m_done; }
+
+    const size_t m_maxSize;
+    std::vector<char> m_data;
+    const char* m_current = 0;
+    int64_t m_fileOffsetStart = 0;
+    bool m_done = false;
 };
 
 // A helper class that does a pass over the input file building up
@@ -149,18 +255,8 @@ public:
 
 private:
     FILE* m_file;
-
-    int64_t m_fileOffsetStart;
-    int64_t m_fileOffsetEnd;
-
-    std::unique_ptr<char[]> m_buffer;
-    const size_t m_bufferSize;
-    const char* m_bufferStart;
-    const char* m_bufferEnd;
-    const char* m_pos; // buffer index
-
-    bool m_done; // true, when all input was processed
-
+    int64_t m_fileSize;
+    Buffer m_buffer;
     bool m_hasSequenceIds; // true, when input contains one sequence per line 
                            // or when sequence id column was ignored during indexing.
 
@@ -168,10 +264,6 @@ private:
     Index m_index;
 
     const char m_streamPrefix;
-
-    // fills up the buffer with data from file, all previously buffered data
-    // will be overwritten.
-    void RefillBuffer();
 
     // Moves the buffer position to the beginning of the next line.
     void SkipLine();
@@ -192,9 +284,6 @@ private:
     // Does not do any sequence parsing, instead uses line number as 
     // the corresponding sequence id.
     void BuildFromLines();
-
-    // Returns current offset in the input file (in bytes). 
-    int64_t GetFileOffset() const { return m_fileOffsetStart + (m_pos - m_bufferStart); }
 
     DISABLE_COPY_AND_MOVE(Indexer);
 };
