@@ -35,7 +35,7 @@ void Indexer::BuildFromLines()
         if (pos)
         {
             auto sequenceOffset = offset;
-            offset = m_buffer.GetFileOffset() + 1;
+            offset = m_buffer.GetFileOffset();
             m_index.AddSequence(SequenceDescriptor{ KeyType{ lines, 0 }, 1 }, sequenceOffset, offset);
             ++lines;
         }
