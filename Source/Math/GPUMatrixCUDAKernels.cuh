@@ -5587,7 +5587,7 @@ __global__ void _assignTotalScore(ElemType *betaScore,
         LONG64 alphaId_0 = (uttBeginFrame[uttId] * numChannels + uttToChanInd[uttId]) * maxPhoneNum;
 
         betaScore[alphaId_0] = logaddk(betaScore[alphaId_0 + 1], betaScore[alphaId_0 + 2]);
-        totalScore[uttId] = betaScore[alphaId_0];
+        atomicAdd(&totalScore[0], betaScore[alphaId_0]);
     }
 }
 
